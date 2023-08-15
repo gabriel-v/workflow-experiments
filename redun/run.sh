@@ -25,4 +25,4 @@ if ! ( docker ps | grep $DOCKER_CONTAINER_NAME ) >/dev/null; then
                 sleep 10000000
 fi
 
-time docker exec $DOCKER_CONTAINER_NAME ./start.sh
+time docker exec -it $DOCKER_CONTAINER_NAME ./start.sh
