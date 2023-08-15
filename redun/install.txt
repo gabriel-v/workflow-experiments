@@ -1,0 +1,3 @@
+sudo apt-get install libpq-dev -y gcc   graphviz graphviz-dev
+pipenv install 'redun[viz]' 'redun[postgres]' 'redun'
+

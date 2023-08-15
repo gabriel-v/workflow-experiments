@@ -1,0 +1,3 @@
+[redun] Execution duration: 16.42 seconds
+final result {'path': b'/opt/node/collections/testdata/data', 'file_cnt': 990, 'dir_cnt': 461, 'distinct_files': 297}
+
