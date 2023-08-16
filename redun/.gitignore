@@ -1,2 +1,3 @@
 /.redun
 /pg_data
+__pycache__

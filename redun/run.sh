@@ -2,7 +2,7 @@
 set -ex
 export DOCKER_IMG=redun_test_img:redun_test_img
 export DOCKER_CONTAINER_NAME=redun_test_cont
-export MOUNT_DATA=/opt/node/collections/testdata/data
+export MOUNT_DATA=/opt/node/collections
 
 docker build . --tag $DOCKER_IMG >/dev/null
 
@@ -13,6 +13,7 @@ if ! ( docker ps | grep $DOCKER_CONTAINER_NAME ) >/dev/null; then
                 --rm \
                 --hostname $DOCKER_CONTAINER_NAME \
                 --name $DOCKER_CONTAINER_NAME \
+                -e PGUSER=postgres -e PGPASSWORD=postgres \
                 -v "$PWD:/v" \
                 -v "$MOUNT_DATA:$MOUNT_DATA" \
                 -w /v \
