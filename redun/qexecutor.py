@@ -97,7 +97,6 @@ class PgExecutor(Executor):
         except Exception as error:
             self._scheduler.reject_job(None, error)
 
-        self.log("Shutting down executor...", level=logging.DEBUG)
         self.stop()
 
     def _monitor_one(self):

@@ -9,6 +9,9 @@ import time
 import psycopg2
 from psycopg2.extensions import ISOLATION_LEVEL_AUTOCOMMIT
 
+
+from processify import processify
+
 DB_NAME = 'redun_test_4'
 QUEUE_SEND = 'queue_send'
 QUEUE_RECV = 'queue_recv'
@@ -79,7 +82,7 @@ def run_worker_single(queue, result_queue=None):
 
     Return True if we ran something - so we should run more.
     """
-    BATCH_LIMIT = 10
+    BATCH_LIMIT = 1
     sql_begin = f"""
         BEGIN;
         DELETE FROM {queue}
@@ -145,7 +148,7 @@ def decode_and_run(_pk, queue_time, payload):
         kw = obj.get('kw', dict())
 
         ret_obj['start_time'] = pg_now()
-        ret_obj['result'] = func(*args, **kw)
+        ret_obj['result'] = processify(func)(*args, **kw)
         ret_obj['end_time'] = pg_now()
         print('SUCCESS  task  id =', _pk, '  added =', queue_time, '  size =', len(payload))
         return ret_obj
@@ -164,7 +167,7 @@ def encode_run_params(func, args, kw):
     return encode_obj(obj)
 
 
-def wait_until_notified(queue, timeout=50):
+def wait_until_notified(queue, timeout=3):
     import select
     chan = f'{queue}_channel'
     with cursor() as cur:
@@ -178,12 +181,21 @@ def wait_until_notified(queue, timeout=50):
 def run_worker_forever(queue, result_queue=None):
     while True:
         try:
+            _run_worker_forever(queue, result_queue)
+        except Exception as error:
+            print('RUN WORKER FOREVER PROCRUNNER ERROR: ', str(error))
+            time.sleep(1.0)
+
+@processify
+def _run_worker_forever(queue, result_queue=None):
+    while True:
+        try:
             run_worker_until_empty(queue, result_queue)
             wait_until_notified(queue)
             run_worker_until_empty(queue, result_queue)
             time.sleep(0.001)
         except Exception as error:
-            print('RUN WORKER FOREVER REACHED ERROR: ', str(error))
+            print('RUN WORKER FOREVER ERROR: ', str(error))
             time.sleep(1.0)
 
 

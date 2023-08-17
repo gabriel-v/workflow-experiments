@@ -118,7 +118,7 @@ def handle_files(paths):
     return [handle_file(x) for x in paths]
 
 
-def hash_file(path):
+def hash_file_py(path):
     import hashlib
 
     with open(path, "rb") as f:
@@ -128,8 +128,16 @@ def hash_file(path):
     return file_hash.hexdigest()
 
 
+def hash_file_bash(path):
+    def decode(bytes_):
+        return bytes_.decode('utf-8', 'surrogateescape')
+    md5 = subprocess.check_output(["md5sum",  decode(path)])
+    md5 = md5.split(b' ')[0].decode('ascii')
+    return md5
+
+
 def handle_file(path):
-    md5 = hash_file(path)
+    md5 = hash_file_bash(path)
     return {'md5': md5, 'path': path, 'doc': handle_doc(md5)}
 
 
