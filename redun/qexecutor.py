@@ -1,5 +1,9 @@
+import logging
+import os
+import threading
 import sys
 import typing
+from collections import OrderedDict
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from multiprocessing import get_context, get_start_method, set_start_method
 from typing import Any, Callable, Optional, Tuple
@@ -14,21 +18,20 @@ if typing.TYPE_CHECKING:
     from redun.scheduler import Job, Scheduler
 
 
-from qbase import QUEUE_SEND, QUEUE_RECV, submit_tasks, run_worker_until_empty
+from qbase import QUEUE_SEND, QUEUE_RECV, submit_task, fetch_result, wait_until_notified
 
 
-def exec_task(module_name: str, task_fullname: str, args: Tuple, kwargs: dict) -> Any:
+def exec_task(job_id: int, module_name: str, task_fullname: str, args: Tuple, kwargs: dict) -> Any:
     """
     Execute a task in the new process.
     """
+    print('exec_task', job_id, module_name, task_fullname)
     load_task_module(module_name, task_fullname)
     task = get_task_registry().get(task_fullname)
     return task.func(*args, **kwargs)
 
 
-def exec_script_task(
-    module_name: str, task_fullname: str, args: Tuple, kwargs: dict
-) -> bytes:
+def exec_script_task(job_id: int, module_name: str, task_fullname: str, args: Tuple, kwargs: dict) -> bytes:
     """
     Execute a script task from the task registry.
     """
@@ -50,7 +53,7 @@ class PgExecutor(Executor):
 
         self._scratch_root = "/tmp/redun"
         self._is_running = False
-        # self._pending_jobs: Dict[str, "Job"] = OrderedDict()
+        self._pending_jobs: Dict[str, "Job"] = OrderedDict()
         self._thread: Optional[threading.Thread] = None
 
     def stop(self) -> None:
@@ -86,10 +89,10 @@ class PgExecutor(Executor):
 
         try:
             while self._is_running:
-                # TODO get ack, response, and call remaining stuff
-                # if ok: self._scheduler.done_job(job, future.result())
-                # if err: self._scheduler.reject_job(job, error)
-                pass
+                while self._monitor_one():
+                    pass
+                if self._is_running:
+                    wait_until_notified(QUEUE_RECV, timeout=2)
 
         except Exception as error:
             self._scheduler.reject_job(None, error)
@@ -97,19 +100,39 @@ class PgExecutor(Executor):
         self.log("Shutting down executor...", level=logging.DEBUG)
         self.stop()
 
+    def _monitor_one(self):
+        with fetch_result(QUEUE_RECV) as result:
+            if result is None:
+                return False
+
+            job_id = result['task_args']['kw']['job_id']
+            try:
+                job = self._pending_jobs.pop(job_id)
+            except Exception:
+                print('unknwon job: ', job_id)
+                return False
+            if 'error' in result:
+                self._scheduler.reject_job(job, result['error'])
+            elif 'result' in result:
+                self._scheduler.done_job(job, result['result'])
+            else:
+                raise RuntimeError('monitor: unknown object response val: ' + str(result))
+            return True
+
     def _submit(self, exec_func: Callable, job: "Job") -> None:
         self._start()
-        def on_done(future):
-            try:
-                self._scheduler.done_job(job, future.result())
-            except Exception as error:
-                self._scheduler.reject_job(job, error)
 
-        assert job.args
         args, kwargs = job.args
-        executor.submit(
-            exec_func, job.task.load_module, job.task.fullname, args, kwargs
-        ).add_done_callback(on_done)
+        self._pending_jobs[job.id] = job
+        submit_task(
+            QUEUE_SEND,
+            exec_func,
+            job_id=job.id,
+            module_name=job.task.load_module,
+            task_fullname=job.task.fullname,
+            args=args,
+            kwargs=kwargs,
+        )
 
     def submit(self, job: "Job") -> None:
         assert not job.task.script

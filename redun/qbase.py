@@ -1,3 +1,5 @@
+import sys
+import traceback
 import binascii
 import pickle
 import random
@@ -7,7 +9,7 @@ import time
 import psycopg2
 from psycopg2.extensions import ISOLATION_LEVEL_AUTOCOMMIT
 
-DB_NAME = 'redun_test_2'
+DB_NAME = 'redun_test_4'
 QUEUE_SEND = 'queue_send'
 QUEUE_RECV = 'queue_recv'
 TEST_Q = 'qsub'
@@ -23,7 +25,7 @@ def create_db():
     try:
         with cursor(db=None) as cur:
             cur.execute(sql)
-    except psycopg2.errors.DuplicateDatabase:
+    except (psycopg2.errors.DuplicateDatabase, psycopg2.errors.UniqueViolation):
         pass
 
 
@@ -35,8 +37,11 @@ def create_queue_table(queue):
             payload	text
         );
     """
-    with cursor() as cur:
-        cur.execute(sql)
+    try:
+        with cursor() as cur:
+            cur.execute(sql)
+    except (psycopg2.errors.UniqueViolation):
+        pass
 
 
 def pg_now():
@@ -68,7 +73,13 @@ def init():
 
 
 def run_worker_single(queue, result_queue=None):
-    BATCH_LIMIT = 1
+    """Fetch a batch of tasks from the queue and run them.
+
+    If we have a result queue, result is put on that.
+
+    Return True if we ran something - so we should run more.
+    """
+    BATCH_LIMIT = 10
     sql_begin = f"""
         BEGIN;
         DELETE FROM {queue}
@@ -117,13 +128,13 @@ def fetch_result(queue):
 
 
 def run_worker_until_empty(queue, result_queue=None):
-    print('looking for tasks...')
+    # print('looking for tasks...')
     while run_worker_single(queue, result_queue):
         pass
 
 
 def decode_and_run(_pk, queue_time, payload):
-    print('started  task  id =', _pk, '  added =', queue_time, '  size =', len(payload))
+    print('STARTED  task  id =', _pk, '  added =', queue_time, '  size =', len(payload))
     ret_obj = {'_pk': _pk, 'queue_time': queue_time, 'size': len(payload),}
     try:
         obj = decode_obj(payload)
@@ -140,8 +151,10 @@ def decode_and_run(_pk, queue_time, payload):
         return ret_obj
     except Exception as e:
         print('ERROR in task  id =', _pk, '  added =', queue_time, ' err = ', str(e))
+        traceback.print_exception(*sys.exc_info())
         ret_obj['end_time'] = pg_now()
-        return {'error': e}
+        ret_obj['error'] = e
+        return ret_obj
 
 
 def encode_run_params(func, args, kw):
@@ -151,20 +164,24 @@ def encode_run_params(func, args, kw):
     return encode_obj(obj)
 
 
-def run_worker_forever(queue, result_queue=None):
+def wait_until_notified(queue, timeout=50):
     import select
-    sql_listen = f'LISTEN {queue}_channel;'
-    sql_unlisten = f'UNLISTEN {queue}_channel;'
-    SELECT_TIMEOUT = 60
+    chan = f'{queue}_channel'
+    with cursor() as cur:
+        cur.execute(f'LISTEN {chan};')
+        conn = cur.connection
+        timeout = int(timeout * (0.5 + random.random()))
+        # print('listening on ', chan, 'for', timeout, 'sec')
+        select.select((conn,), (), (), timeout)
+
+
+def run_worker_forever(queue, result_queue=None):
     while True:
         try:
             run_worker_until_empty(queue, result_queue)
-            with cursor() as cur:
-                cur.execute(sql_listen)
-                conn = cur.connection
-                timeout = int(SELECT_TIMEOUT * (0.5 + random.random()))
-                print('hibernating for', timeout, 'sec')
-                select.select((conn,), (), (), timeout)
+            wait_until_notified(queue)
+            run_worker_until_empty(queue, result_queue)
+            time.sleep(0.001)
         except Exception as error:
             print('RUN WORKER FOREVER REACHED ERROR: ', str(error))
             time.sleep(1.0)

@@ -4,7 +4,7 @@ export DOCKER_IMG=redun_test_img:redun_test_img
 export DOCKER_CONTAINER_NAME=redun_test_cont
 export MOUNT_DATA=/opt/node/collections
 
-docker build . --tag $DOCKER_IMG >/dev/null
+# docker build . --tag $DOCKER_IMG >/dev/null
 
 docker rm -f $DOCKER_CONTAINER_NAME || true
 if ! ( docker ps | grep $DOCKER_CONTAINER_NAME ) >/dev/null; then
@@ -23,7 +23,8 @@ if ! ( docker ps | grep $DOCKER_CONTAINER_NAME ) >/dev/null; then
                 --memory 6gb \
                 --memory-swap 6gb \
                 $DOCKER_IMG \
-                sleep 10000000
+                ./start.sh
+
 fi
 
-time docker exec -it $DOCKER_CONTAINER_NAME ./start.sh
+docker logs -f $DOCKER_CONTAINER_NAME

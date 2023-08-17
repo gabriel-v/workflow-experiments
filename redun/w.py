@@ -7,18 +7,27 @@ import subprocess
 # from redun.file import LocalFileSystem
 # redun.file.get_filesystem = lambda *k, **w: LocalFileSystem()
 
-from redun import task
+import redun.scripting
+redun.scripting.prepare_command = lambda x, **k: x
+redun.scripting.get_command_eof = lambda x, **k: 'EOFFFFF999'
+
+from redun import task, script
 from redun.functools import map_, apply_func, force
 
 
-from qbase import DB_NAME, create_queue_table, create_db, PG_URI
+from qbase import DB_NAME, create_queue_table, create_db, PG_URI, init
+
+import qexecutor
+
+init()
 
 
-ROOT = '/opt/node/collections/testdata/data'
-redun_namespace = 'walk'
+ROOT = b'/opt/node/collections/testdata/data'
+redun_namespace = 'w'
 
-DIR_BATCH_COUNT = 500
-FILE_BATCH_SIZE_BYTES = 5 * 2**20 # 50MB batches
+DIR_BATCH_COUNT = 1000
+FILE_BATCH_SIZE_BYTES = 66 * 2**20 # 10MB batches
+FILE_BATCH_MAX_COUNT = 10000
 
 
 def main():
@@ -35,16 +44,13 @@ def main():
             "automigrate": True,
         },
         "executors.default": {
-            "type": "local",
-            "mode": "processes",
-            "max_workers": 40,
-            "scratch": "./tmp",
+            "type": "pg",
         }},
     ))
     scheduler.load()  # Auto-creates the redun.db file as needed and starts a db connection.
     result = scheduler.run(root())
-    # result['distinct_files'] = len(result['hashes'])
-    # del result['hashes']
+    result['distinct_files'] = len(result['hashes'])
+    del result['hashes']
     print('final result', result)
 
 
@@ -52,15 +58,8 @@ def main():
 @task()
 def root():
     print('+root')
-    return walk([encode(ROOT)])
+    return walk([ROOT])[0]
 
-
-def encode(str_):
-    return str_.encode('utf-8', 'surrogateescape')
-
-
-def decode(bytes_):
-    return bytes_.decode('utf-8', 'surrogateescape')
 
 
 @task()
@@ -82,7 +81,7 @@ def walk(paths):
             elif os.path.isfile(item):
                 files.append(item)
                 file_size += os.stat(item).st_size
-                if file_size > FILE_BATCH_SIZE_BYTES:
+                if file_size > FILE_BATCH_SIZE_BYTES or len(files) > FILE_BATCH_MAX_COUNT:
                     files_fut.append(handle_files(files))
                     files = []
                     file_size = 0
@@ -95,22 +94,22 @@ def walk(paths):
     return walk_combine(paths, dirs_fut, files_fut)
 
 
-@task()
+@task(check_valid="shallow")
 def walk_combine(paths, dirs, files):
     dirs = sum(dirs, start=[])
     files = sum(files, start=[])
     dir_cnt = sum(d['dir_cnt'] for d in dirs) + len(paths)
     file_cnt = len(files) + sum(d['file_cnt'] for d in dirs)
     file_paths = {}
-    # file_hashes = set(f['md5'] for f in files)
-    # for d in dirs:
-    #     file_hashes |= d['hashes']
+    file_hashes = set(f['md5'] for f in files)
+    for d in dirs:
+        file_hashes |= d['hashes']
 
     return [{
         'path': paths[0],
         'file_cnt': file_cnt,
         'dir_cnt': dir_cnt,
-        # 'hashes': file_hashes,
+        'hashes': file_hashes,
     }]
 
 
@@ -118,10 +117,19 @@ def walk_combine(paths, dirs, files):
 def handle_files(paths):
     return [handle_file(x) for x in paths]
 
+
+def hash_file(path):
+    import hashlib
+
+    with open(path, "rb") as f:
+        file_hash = hashlib.md5()
+        while chunk := f.read(8192):
+            file_hash.update(chunk)
+    return file_hash.hexdigest()
+
+
 def handle_file(path):
-    # print(os.getpid(), '+handle_file', path)
-    md5 = subprocess.check_output(["md5sum", '{decode(path)}'], shell=True)
-    md5 = md5.split(b' ')[0].decode('ascii')
+    md5 = hash_file(path)
     return {'md5': md5, 'path': path, 'doc': handle_doc(md5)}
 
 
