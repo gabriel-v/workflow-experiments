@@ -10,4 +10,5 @@ for i in $( seq 1 16 ); do
   python qxxworker.py &
 done
 
-python w.py
+python w.py || true
+sleep 1000000000

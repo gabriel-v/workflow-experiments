@@ -3,9 +3,10 @@ from functools import wraps
 import os
 import subprocess
 
-# import redun.file
-# from redun.file import LocalFileSystem
-# redun.file.get_filesystem = lambda *k, **w: LocalFileSystem()
+import redun.file
+from redun.file import LocalFileSystem
+redun.file.get_filesystem = lambda *k, **w: LocalFileSystem()
+from redun import File as RedunFile, Dir as RedunDir
 
 import redun.scripting
 redun.scripting.prepare_command = lambda x, **k: x
@@ -15,11 +16,41 @@ from redun import task, script
 from redun.functools import map_, apply_func, force
 
 
-from qbase import DB_NAME, create_queue_table, create_db, PG_URI, init
+class File(RedunFile):
+    def __init__(self, path):
+        # hack to avoid fixing broken paths
+        self.filesystem = LocalFileSystem()
+        self.path = path
+        self.stream = None
+        self._hash = None
+        self.classes.File = File
+    def __setstate__(self, state: dict) -> None:
+        self.path = state["path"]
+        self._hash = state["hash"]
+        self.filesystem = LocalFileSystem()
+
+
+# class Dir(RedunDir):
+#     def __setstate__(self, state: dict) -> None:
+#         self.pattern = os.path.join(state["path"], b"**")
+#         self.path = state["path"]
+#         self._hash = state["hash"]
+#         self.filesystem = LocalFileSystem()
+#         self._files = None
+#     def __init__(self, path: str):
+#         # path = path.rstrip("/")
+#         self.path = path
+#         pattern = os.path.join(path, b"**")
+#         self.pattern = pattern
+#         self.filesystem: FileSystem = LocalFileSystem()
+#         self._hash: Optional[str] = None
+#         self._files: Optional[List[File]] = None
+#         self.classes.File = File
+
+
+from qbase import DB_NAME, create_queue_table, PG_URI, init
 
 import qexecutor
-
-init()
 
 
 ROOT = b'/opt/node/collections/testdata/data'
@@ -29,25 +60,45 @@ DIR_BATCH_COUNT = 1000
 FILE_BATCH_SIZE_BYTES = 66 * 2**20 # 10MB batches
 FILE_BATCH_MAX_COUNT = 10000
 
+os.makedirs('./.redun', exist_ok=True)
+REDUN_CONFIG_FILE = './.redun/redun.ini'
+REDUN_CONFIG_VAL = {
+    "backend": {
+        "db_uri": PG_URI + DB_NAME,
+        "automigrate": True,
+    },
+    "executors.default": {
+        "type": "pg",
+    }
+}
 
-def main():
+
+def write_config_file(config_dict, path):
+    import configparser
+    with open(path, 'w') as file:
+        config_object = configparser.ConfigParser()
+        sections=config_dict.keys()
+        for section in sections:
+            config_object.add_section(section)
+        for section in sections:
+            inner_dict=config_dict[section]
+            fields=inner_dict.keys()
+            for field in fields:
+                value=inner_dict[field]
+                config_object.set(section, field, str(value))
+        print('writing config to file', path)
+        config_object.write(file)
+
+
+def redun_run_main():
     from redun import Scheduler
     from redun.config import Config
 
     # enable for PG
-    create_db()
-    scheduler = Scheduler(config=Config({
-        # if commented out, memory-only setup, somewhat multi-threaded ~15s
-        "backend": {
-            # "db_uri": "sqlite:///redun.db",  # > 90s sqlite single-threaded
-            "db_uri": PG_URI + DB_NAME,  # 45s pg (also somehow single threaded)
-            "automigrate": True,
-        },
-        "executors.default": {
-            "type": "pg",
-        }},
-    ))
-    scheduler.load()  # Auto-creates the redun.db file as needed and starts a db connection.
+    init()
+    config = Config(REDUN_CONFIG_VAL)
+    scheduler = Scheduler(config=config)
+    scheduler.load()
     result = scheduler.run(root())
     result['distinct_files'] = len(result['hashes'])
     del result['hashes']
@@ -58,7 +109,7 @@ def main():
 @task()
 def root():
     print('+root')
-    return walk([ROOT])[0]
+    return walk([File(ROOT)])[0]
 
 
 
@@ -70,16 +121,17 @@ def walk(paths):
     dirs_fut = []
     files_fut = []
     for path in paths:
+        path = path.path
         # print(os.getpid(), '+walk', path)
         for item in sorted(os.listdir(path)):
             item = os.path.join(path, item)
             if os.path.isdir(item):
-                dirs.append(item)
+                dirs.append(File(item))
                 if len(dirs) > DIR_BATCH_COUNT:
                     dirs_fut.append(walk(dirs))
                     dirs = []
             elif os.path.isfile(item):
-                files.append(item)
+                files.append(File(item))
                 file_size += os.stat(item).st_size
                 if file_size > FILE_BATCH_SIZE_BYTES or len(files) > FILE_BATCH_MAX_COUNT:
                     files_fut.append(handle_files(files))
@@ -89,8 +141,10 @@ def walk(paths):
                 print('UNKNWON THING TYPE: ', item)
     if files:
         files_fut.append(handle_files(files))
+        files = []
     if dirs:
         dirs_fut.append(walk(dirs))
+        dirs = []
     return walk_combine(paths, dirs_fut, files_fut)
 
 
@@ -115,7 +169,7 @@ def walk_combine(paths, dirs, files):
 
 @task()
 def handle_files(paths):
-    return [handle_file(x) for x in paths]
+    return [handle_file(x.path) for x in paths]
 
 
 def hash_file_py(path):
@@ -145,6 +199,30 @@ def handle_file(path):
 def handle_doc(md5):
     # print(os.getpid(), '+handle_doc', md5)
     return {"md5": md5}
+
+
+def redun_cli():
+    from redun.cli import RedunClient, RedunClientError
+    client = RedunClient()
+    try:
+        client.execute()
+    except RedunClientError as error:
+        print(
+            "{error_type}: {error}".format(
+                error_type=type(error).__name__,
+                error=str(error),
+            )
+        )
+        sys.exit(1)
+
+
+def main():
+    import sys
+    write_config_file(REDUN_CONFIG_VAL, REDUN_CONFIG_FILE)
+    if len(sys.argv) > 1:
+        redun_cli()
+    else:
+        redun_run_main()
 
 
 if __name__ == '__main__':

@@ -1,3 +1,5 @@
 /.redun
 /pg_data
 __pycache__
+/*.dot
+/*.png

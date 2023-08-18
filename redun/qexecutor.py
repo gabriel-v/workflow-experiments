@@ -21,7 +21,7 @@ if typing.TYPE_CHECKING:
 from qbase import QUEUE_SEND, QUEUE_RECV, submit_task, fetch_result, wait_until_notified
 
 
-def exec_task(job_id: int, module_name: str, task_fullname: str, args: Tuple, kwargs: dict) -> Any:
+def exec_task(job_id: int, module_name: str, task_fullname: str, args: Tuple, kwargs: dict, **extra) -> Any:
     """
     Execute a task in the new process.
     """
@@ -31,7 +31,7 @@ def exec_task(job_id: int, module_name: str, task_fullname: str, args: Tuple, kw
     return task.func(*args, **kwargs)
 
 
-def exec_script_task(job_id: int, module_name: str, task_fullname: str, args: Tuple, kwargs: dict) -> bytes:
+def exec_script_task(job_id: int, module_name: str, task_fullname: str, args: Tuple, kwargs: dict, **extra) -> bytes:
     """
     Execute a script task from the task registry.
     """
