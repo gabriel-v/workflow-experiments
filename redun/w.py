@@ -1,5 +1,5 @@
+import logging
 import json
-from functools import wraps
 import os
 import subprocess
 
@@ -14,6 +14,12 @@ redun.scripting.get_command_eof = lambda x, **k: 'EOFFFFF999'
 
 from redun import task, script
 from redun.functools import map_, apply_func, force
+from redun import Scheduler
+from redun.config import Config
+
+from flock import flock
+
+log = logging.getLogger(__name__)
 
 
 class File(RedunFile):
@@ -48,9 +54,13 @@ class File(RedunFile):
 #         self.classes.File = File
 
 
-from qbase import DB_NAME, create_queue_table, PG_URI, init
 
 import qexecutor
+
+
+PG_URI = "postgresql://localhost:5432/"
+DB_NAME = 'redun_db'
+QUEUE_DB_NAME = 'queue_db'
 
 
 ROOT = b'/opt/node/collections/testdata/data'
@@ -61,6 +71,7 @@ FILE_BATCH_SIZE_BYTES = 66 * 2**20 # 10MB batches
 FILE_BATCH_MAX_COUNT = 10000
 
 os.makedirs('./.redun', exist_ok=True)
+DB_NAME = "redun_db"
 REDUN_CONFIG_FILE = './.redun/redun.ini'
 REDUN_CONFIG_VAL = {
     "backend": {
@@ -69,8 +80,26 @@ REDUN_CONFIG_VAL = {
     },
     "executors.default": {
         "type": "pg",
+        "dsn": PG_URI + QUEUE_DB_NAME,
     }
 }
+
+
+def create_db(opt, db_name):
+    import psycopg2
+    _sql = psycopg2.sql.SQL("""
+    CREATE DATABASE {db_name};
+    """).format(db_name=psycopg2.sql.Identifier(db_name))
+
+    conn = psycopg2.connect(**opt)
+    cur = conn.cursor()
+    cur.connection.autocommit = True
+    try:
+        cur.execute(_sql)
+    except (psycopg2.errors.DuplicateDatabase, psycopg2.errors.UniqueViolation):
+        pass
+    cur.close()
+    conn.close()
 
 
 def write_config_file(config_dict, path):
@@ -90,19 +119,6 @@ def write_config_file(config_dict, path):
         config_object.write(file)
 
 
-def redun_run_main():
-    from redun import Scheduler
-    from redun.config import Config
-
-    # enable for PG
-    init()
-    config = Config(REDUN_CONFIG_VAL)
-    scheduler = Scheduler(config=config)
-    scheduler.load()
-    result = scheduler.run(root())
-    result['distinct_files'] = len(result['hashes'])
-    del result['hashes']
-    print('final result', result)
 
 
 
@@ -216,13 +232,52 @@ def redun_cli():
         sys.exit(1)
 
 
+def get_redun_scheduler(config):
+    import time
+    for _ in range(3):
+        try:
+            config = Config(config)
+            scheduler = Scheduler(config=config)
+            scheduler.load(migrate=True)
+            return scheduler
+        except Exception as e:
+            time.sleep(1.0)
+            log.warning(str(e))
+    log.exception(e)
+    raise e
+
+
+def redun_run_main(scheduler):
+    result = scheduler.run(root())
+    result['distinct_files'] = len(result['hashes'])
+    del result['hashes']
+    print('final result', result)
+
+
+def start_worker(scheduler, executor_name):
+    scheduler.executors[executor_name].run_worker()
+
+
+
+@flock
+def init_scheduler():
+    write_config_file(REDUN_CONFIG_VAL, REDUN_CONFIG_FILE)
+    create_db({'dsn': PG_URI}, DB_NAME)
+    create_db({'dsn': PG_URI}, QUEUE_DB_NAME)
+    return get_redun_scheduler(REDUN_CONFIG_VAL)
+
+
 def main():
     import sys
-    write_config_file(REDUN_CONFIG_VAL, REDUN_CONFIG_FILE)
+    scheduler = init_scheduler()
+
     if len(sys.argv) > 1:
-        redun_cli()
+        if sys.argv[1] == 'start-pg-executor-worker':
+            start_worker(scheduler, sys.argv[2])
+        else:
+            redun_cli()
     else:
-        redun_run_main()
+        redun_run_main(scheduler)
 
 
 if __name__ == '__main__':

@@ -1,7 +1,7 @@
 docker rm -f phppgadmin
 docker run --name='phppgadmin' -d \
-  --publish=80:80 \
   --net host \
-    -e 'PGADMIN_DEFAULT_EMAIL=r@r.r' \
+    -e 'PGADMIN_DEFAULT_EMAIL=root@root.com' \
     -e 'PGADMIN_DEFAULT_PASSWORD=root' \
+    -e 'PGADMIN_LISTEN_PORT=9999' \
 dpage/pgadmin4

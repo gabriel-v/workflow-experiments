@@ -4,11 +4,13 @@ rm -rf *.png *.dot redun.db .redun tmp
 
 until PGUSER=postgres PGPASSWORD=postgres psql postgresql://localhost:5432 -l --no-readline >/dev/null; do sleep 1; done
 
+sleep 1
 
 for i in $( seq 1 16 ); do
-  echo $i; 
-  python qxxworker.py &
+  python w.py start-pg-executor-worker default &
 done
+
+sleep 1
 
 python w.py || true
 sleep 1000000000
