@@ -1,6 +1,5 @@
 import sys
 import traceback
-import binascii
 import pickle
 import random
 import contextlib
@@ -38,7 +37,7 @@ def create_queue_table(queue):
         CREATE TABLE IF NOT EXISTS {queue} (
             id int not null primary key generated always as identity,
             queue_time	timestamptz default now(),
-            payload	text
+            payload	bytea
         );
     """).format(queue=sql.Identifier(queue))
     try:
@@ -225,10 +224,9 @@ def submit_task(queue, func, *args, **kw):
 
 
 def encode_obj(obj):
-    rv = binascii.b2a_base64(pickle.dumps(obj)).decode('ascii')
-    assert isinstance(rv, str)
+    rv = pickle.dumps(obj)
     return rv
 
 
-def decode_obj(str_):
-    return pickle.loads(binascii.a2b_base64(str_))
+def decode_obj(bytes_):
+    return pickle.loads(bytes_)
