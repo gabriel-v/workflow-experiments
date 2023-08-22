@@ -7,6 +7,7 @@ import contextlib
 import time
 
 import psycopg2
+from psycopg2 import sql
 from psycopg2.extensions import ISOLATION_LEVEL_AUTOCOMMIT
 
 
@@ -21,28 +22,28 @@ PG_URI = "postgresql://localhost:5432/"
 
 
 def create_db():
-    sql = f"""
+    _sql = sql.SQL("""
     CREATE DATABASE {DB_NAME};
-    """
+    """).format(DB_NAME=sql.Identifier(DB_NAME))
 
     try:
         with cursor(db=None) as cur:
-            cur.execute(sql)
+            cur.execute(_sql)
     except (psycopg2.errors.DuplicateDatabase, psycopg2.errors.UniqueViolation):
         pass
 
 
 def create_queue_table(queue):
-    sql = f"""
+    _sql = sql.SQL("""
         CREATE TABLE IF NOT EXISTS {queue} (
             id int not null primary key generated always as identity,
             queue_time	timestamptz default now(),
             payload	text
         );
-    """
+    """).format(queue=sql.Identifier(queue))
     try:
         with cursor() as cur:
-            cur.execute(sql)
+            cur.execute(_sql)
     except (psycopg2.errors.UniqueViolation):
         pass
 
@@ -83,14 +84,14 @@ def run_worker_single(queue, result_queue=None):
     Return True if we ran something - so we should run more.
     """
     BATCH_LIMIT = 1
-    sql_begin = f"""
+    sql_begin = sql.SQL("""
         BEGIN;
         DELETE FROM {queue}
         USING (
             SELECT * FROM {queue} LIMIT {BATCH_LIMIT} FOR UPDATE SKIP LOCKED
         ) q
         WHERE q.id = {queue}.id RETURNING {queue}.*;
-    """
+    """).format(BATCH_LIMIT=sql.Literal(BATCH_LIMIT), queue=sql.Identifier(queue))
 
     with cursor(autocommit=False) as cur:
         cur.execute(sql_begin)
@@ -110,14 +111,14 @@ def run_worker_single(queue, result_queue=None):
 
 @contextlib.contextmanager
 def fetch_result(queue):
-    sql_begin = f"""
+    sql_begin = sql.SQL("""
         BEGIN;
         DELETE FROM {queue}
         USING (
             SELECT * FROM {queue} LIMIT 1 FOR UPDATE SKIP LOCKED
         ) q
         WHERE q.id = {queue}.id RETURNING {queue}.*;
-    """
+    """).format(queue=sql.Identifier(queue))
     with cursor(autocommit=False) as cur:
         cur.execute(sql_begin)
         v = cur.fetchall()
@@ -169,9 +170,10 @@ def encode_run_params(func, args, kw):
 
 def wait_until_notified(queue, timeout=3):
     import select
-    chan = f'{queue}_channel'
+    chan = queue + '_channel'
+    sql_listen = sql.SQL('LISTEN {chan};').format(chan=sql.Identifier(chan))
     with cursor() as cur:
-        cur.execute(f'LISTEN {chan};')
+        cur.execute(sql_listen)
         conn = cur.connection
         timeout = int(timeout * (0.5 + random.random()))
         # print('listening on ', chan, 'for', timeout, 'sec')
@@ -200,22 +202,22 @@ def _run_worker_forever(queue, result_queue=None):
 
 
 def submit_encoded_tasks(queue, payloads, existing_cursor=None):
-    sql_notify = f"NOTIFY {queue}_channel;"
+    chan = queue + '_channel'
+    sql_notify = sql.SQL('NOTIFY {chan};').format(chan=sql.Identifier(chan))
+    sql_insert = sql.SQL("INSERT INTO {queue} (payload) VALUES ({payloads}) RETURNING id;")
+    sql_insert = sql_insert.format(queue=sql.Identifier(queue), payloads=sql.SQL(',').join(sql.Placeholder() * len(payloads)))
 
-    def _do_it(cur):
-        ids = []
-        for payload in payloads:
-            sql = f"INSERT INTO {queue} (payload) VALUES ('{payload}') RETURNING id;"
-            cur.execute(sql)
-            ids.append(cur.fetchone()[0])
-            cur.execute(sql_notify)
+    def _execute(cur):
+        cur.execute(sql_insert, payloads)
+        ids = [x[0] for x in cur.fetchall()]
+        cur.execute(sql_notify)
         return ids
 
     if existing_cursor:
-        return _do_it(existing_cursor)
+        return _execute(existing_cursor)
     else:
         with cursor() as cur:
-            return _do_it(cur)
+            return _execute(cur)
 
 
 def submit_task(queue, func, *args, **kw):
