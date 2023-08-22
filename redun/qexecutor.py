@@ -18,14 +18,13 @@ if typing.TYPE_CHECKING:
     from redun.scheduler import Job, Scheduler
 
 
-from qbase import QUEUE_SEND, QUEUE_RECV, submit_task, fetch_result, wait_until_notified
+from qbase import QUEUE_SEND, QUEUE_RECV, submit_task, fetch_results, wait_until_notified, get_cursor
 
 
 def exec_task(job_id: int, module_name: str, task_fullname: str, args: Tuple, kwargs: dict, **extra) -> Any:
     """
     Execute a task in the new process.
     """
-    print('exec_task', job_id, module_name, task_fullname)
     load_task_module(module_name, task_fullname)
     task = get_task_registry().get(task_fullname)
     return task.func(*args, **kwargs)
@@ -56,11 +55,15 @@ class PgExecutor(Executor):
         self._pending_jobs: Dict[str, "Job"] = OrderedDict()
         self._thread: Optional[threading.Thread] = None
 
+        self._thread_signal_read_fd = None
+        self._thread_signal_write_fd = None
+
     def stop(self) -> None:
         """
         Stop Executor and monitoring thread.
         """
         self._is_running = False
+        os.write(self._thread_signal_write_fd, b'x')
 
         # Stop monitor thread.
         if (
@@ -77,6 +80,8 @@ class PgExecutor(Executor):
         os.makedirs(self._scratch_root, exist_ok=True)
 
         if not self._is_running:
+
+            self._thread_signal_read_fd, self._thread_signal_write_fd = os.pipe()
             self._is_running = True
             self._thread = threading.Thread(target=self._monitor, daemon=False)
             self._thread.start()
@@ -88,34 +93,37 @@ class PgExecutor(Executor):
         assert self._scheduler
 
         try:
-            while self._is_running:
-                while self._monitor_one():
-                    pass
-                if self._is_running:
-                    wait_until_notified(QUEUE_RECV, timeout=2)
+            with get_cursor() as cur:
+                while self._is_running:
+                    while self._monitor_one(cur):
+                        pass
+                    if self._is_running:
+                        wait_until_notified(cur, QUEUE_RECV, extra_read_fd=self._thread_signal_read_fd)
 
         except Exception as error:
             self._scheduler.reject_job(None, error)
 
         self.stop()
 
-    def _monitor_one(self):
-        with fetch_result(QUEUE_RECV) as result:
-            if result is None:
+    def _monitor_one(self, cur):
+        with fetch_results(cur, QUEUE_RECV) as results:
+            if results is None:
                 return False
 
-            job_id = result['task_args']['kw']['job_id']
-            try:
-                job = self._pending_jobs.pop(job_id)
-            except Exception:
-                print('unknwon job: ', job_id)
-                return False
-            if 'error' in result:
-                self._scheduler.reject_job(job, result['error'])
-            elif 'result' in result:
-                self._scheduler.done_job(job, result['result'])
-            else:
-                raise RuntimeError('monitor: unknown object response val: ' + str(result))
+            for result in results:
+                job_id = result['task_args']['kw']['job_id']
+                try:
+                    job = self._pending_jobs.pop(job_id)
+                except Exception:
+                    log.error('unknwon job: %s', job_id)
+                    continue
+                if 'error' in result:
+                    self._scheduler.reject_job(job, result['error'])
+                elif 'result' in result:
+                    self._scheduler.done_job(job, result['result'])
+                else:
+                    raise RuntimeError('monitor: unknown object response val: ' + str(result))
+
             return True
 
     def _submit(self, exec_func: Callable, job: "Job") -> None:

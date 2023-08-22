@@ -1,3 +1,5 @@
+#!/bin/bash -ex
+
 docker rm -f redun-pg || true
 rm -rf pg_data || true
 mkdir pg_data
