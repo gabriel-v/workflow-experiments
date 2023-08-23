@@ -11,7 +11,7 @@ from redun import Scheduler
 from redun import task
 from redun import File as RedunFile  #, Dir as RedunDir
 
-import qexecutor  # noqa
+from qexecutor import PgExecutor
 from flock import flock
 
 redun.file.get_filesystem = lambda *k, **w: LocalFileSystem()
@@ -67,7 +67,6 @@ FILE_BATCH_SIZE_BYTES = 66 * 2**20  # 10MB batches
 FILE_BATCH_MAX_COUNT = 10000
 
 os.makedirs('./.redun', exist_ok=True)
-DB_NAME = "redun_db"
 REDUN_CONFIG_FILE = './.redun/redun.ini'
 REDUN_CONFIG_VAL = {
     "backend": {
@@ -77,6 +76,8 @@ REDUN_CONFIG_VAL = {
     "executors.default": {
         "type": "pg",
         "dsn": PG_URI + QUEUE_DB_NAME,
+        'queue_send': 'q1',
+        'queue_recv': 'q2',
     }
 }
 
@@ -249,29 +250,29 @@ def redun_run_main(scheduler):
     print('final result', result)
 
 
-def start_worker(scheduler, executor_name):
-    scheduler.executors[executor_name].run_worker()
+def start_worker(executor_name):
+    config = REDUN_CONFIG_VAL['executors.' + executor_name]
+    PgExecutor.run_worker(config)
 
 
 @flock
-def init_scheduler():
+def init_db():
     write_config_file(REDUN_CONFIG_VAL, REDUN_CONFIG_FILE)
     create_db({'dsn': PG_URI}, DB_NAME)
     create_db({'dsn': PG_URI}, QUEUE_DB_NAME)
-    return get_redun_scheduler(REDUN_CONFIG_VAL)
 
 
 def main():
     import sys
-    scheduler = init_scheduler()
+    init_db()
 
     if len(sys.argv) > 1:
         if sys.argv[1] == 'start-pg-executor-worker':
-            start_worker(scheduler, sys.argv[2])
+            start_worker(sys.argv[2])
         else:
             redun_cli()
     else:
-        redun_run_main(scheduler)
+        redun_run_main(get_redun_scheduler(REDUN_CONFIG_VAL))
 
 
 if __name__ == '__main__':

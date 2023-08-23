@@ -114,7 +114,7 @@ def get_cursor(opt):
         conn.close()
 
 
-def run_worker_single(cur, queue, result_queue=None):
+def run_worker_single(cur, queue, result_queue=None, max_batch_size=1):
     """Fetch a batch of tasks from the queue and run them, optionally returning result on different queue.
 
     The function is fetched, deleted and executed under a single transaction. This means that if the worker crashes, the transaction removing the items from
@@ -126,21 +126,22 @@ def run_worker_single(cur, queue, result_queue=None):
         cur: database cursor to be used
         queue: name of queue table where the tasks are read from
         result_queue: if set, task results are placed on this second queue.
+        max_batch_size: set to allow workers to pull this many tasks at  a time.
 
     Returns:
-        bool: True if we ran something - so we should run more. False otherwise.
+        int: the number of tasks executed in this batch, or 0 if none.
     """    
 
-    BATCH_LIMIT = 1
+    max_batch_size = 1
     sql_begin = sql.SQL("""
         BEGIN;
         DELETE FROM {queue}
         USING (
-            SELECT * FROM {queue} LIMIT {BATCH_LIMIT} FOR UPDATE SKIP LOCKED
+            SELECT * FROM {queue} LIMIT {max_batch_size} FOR UPDATE SKIP LOCKED
         ) q
         WHERE q.id = {queue}.id RETURNING {queue}.*;
     """).format(
-            BATCH_LIMIT=sql.Literal(BATCH_LIMIT),
+            max_batch_size=sql.Literal(max_batch_size),
             queue=sql.Identifier(queue),
     )
 
@@ -153,10 +154,9 @@ def run_worker_single(cur, queue, result_queue=None):
                 rv = encode_obj(rv)
                 submit_encoded_tasks(cur, result_queue, [rv])
         cur.execute("COMMIT;")
-        return True
 
     # no result - try later
-    return False
+    return len(v)
 
 
 @contextlib.contextmanager
@@ -201,9 +201,13 @@ def run_worker_until_empty(cur, queue, result_queue=None):
         cur: database cursor to be used
         queue: name of queue table where the tasks are read from
         result_queue: if set, task results are placed on this second queue.
+    Returns:
+        int: number of tasks finished
     """
-    while run_worker_single(cur, queue, result_queue):
-        pass
+    finished_tasks = 0
+    while (just_finished := run_worker_single(cur, queue, result_queue)) > 0:
+        finished_tasks += just_finished
+    return finished_tasks
 
 
 def decode_and_run(_pk, payload):
@@ -293,32 +297,31 @@ def run_worker_forever(opt, queue, result_queue=None):
     """
     while True:
         try:
-            _run_worker_forever(opt, queue, result_queue)
+            _run_worker_batch(opt, queue, result_queue)
         except Exception as error:
-            log.error('RUN WORKER FOREVER PROCRUNNER ERROR: %s', str(error))
+            log.exception(error)
+            log.error('error while running worker process: %s', str(error))
             time.sleep(1.0)
 
 
 @_processify
-def _run_worker_forever(opt, queue, result_queue=None):
-    """Run a single python worker sub-process until it crashes or errors out.
+def _run_worker_batch(opt, queue, result_queue=None, min_tasks_before_halt=1000):
+    """Run a single python worker sub-process until it either runs the required
+    number of tasks or crashes or errors out.
 
     Args:
-        same as `run_worker_forever`
+        opt, queue, result_queue: same as `run_worker_forever`
+        min_tasks_before_halt: function exists after running at least this number of tasks.
     """
+    finished_tasks = 0
     with get_cursor(opt) as cur:
-        while True:
-            try:
-                run_worker_until_empty(cur, queue, result_queue)
-                wait_until_notified(cur, queue)
-            except Exception as error:
-                log.error('RUN WORKER FOREVER ERROR: %s', str(error))
-                time.sleep(1.0)
+        while finished_tasks < min_tasks_before_halt:
+            finished_tasks += run_worker_until_empty(cur, queue, result_queue)
+            wait_until_notified(cur, queue)
 
 
 def submit_encoded_tasks(cur, queue, payloads):
     """Inserts some payloads into the queue, then notifies any listeners of that queue.
-
 
     **WARNING**: This function requires the caller to run `cur.execute('commit')` and finish the transaction.
     This is done so the caller can control when their own transaction finishes, without using a sub-transaction.
@@ -377,6 +380,21 @@ def exec_script_task(job_id: int, module_name: str, task_fullname: str,
 
 @register_executor("pg")
 class PgExecutor(Executor):
+    """Distributed executor using PostgreSQL tables as queues.
+
+    Inspired by https://www.crunchydata.com/blog/message-queuing-using-native-postgresql
+    """
+
+    @staticmethod
+    def _extract_psycopg2_connect_options(config):
+        return dict(
+            (
+                (k, v)
+                for (k, v) in config.items()
+                if k in ['dbname', 'user', 'password', 'host', 'port', 'dsn']
+            )
+        )
+
     def __init__(
         self,
         name: str,
@@ -387,17 +405,11 @@ class PgExecutor(Executor):
         config = config or dict()
         name = name or 'default'
         self._scratch_root = config.get('scratch_root', "/tmp")
-        self._queue_send = config.get(
-            'queue_send', f'pg_executor_{name}_queue_send')
-        self._queue_recv = config.get(
-            'queue_recv', f'pg_executor_{name}_queue_recv')
-        self._conn_opt = dict(
-            (
-                (k, v)
-                for (k, v) in config.items()
-                if k in ['dbname', 'user', 'password', 'host', 'port', 'dsn']
-            )
-        )
+        self._queue_send = config.get('queue_send')
+        self._queue_recv = config.get('queue_recv')
+        assert self._queue_send, 'queue_send not configured'
+        assert self._queue_recv, 'queue_recv not configured'
+        self._conn_opt = PgExecutor._extract_psycopg2_connect_options(config)
         assert self._conn_opt is not None, 'no psycopg2 connect options given!'
 
         self._is_running = False
@@ -407,12 +419,18 @@ class PgExecutor(Executor):
         self._thread_signal_read_fd = None
         self._thread_signal_write_fd = None
 
-    def run_worker(self):
+    @staticmethod
+    def run_worker(config):
         """Create queue tables and start a single worker process for this executor, then wait for it to finish.
         """
-        create_queue_table(self._conn_opt, self._queue_send)
-        create_queue_table(self._conn_opt, self._queue_recv)
-        run_worker_forever(self._conn_opt, self._queue_send, self._queue_recv)
+        conn_opt = PgExecutor._extract_psycopg2_connect_options(config)
+        queue_send = config.get('queue_send')
+        queue_recv = config.get('queue_recv')
+        assert queue_send, 'queue_send not configured'
+        assert queue_recv, 'queue_recv not configured'
+        create_queue_table(conn_opt, queue_send)
+        create_queue_table(conn_opt, queue_recv)
+        run_worker_forever(conn_opt, queue_send, queue_recv)
 
     def stop(self) -> None:
         """

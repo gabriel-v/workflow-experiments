@@ -6,7 +6,7 @@ until PGUSER=postgres PGPASSWORD=postgres psql postgresql://localhost:5432 -l --
 
 sleep 1
 
-for i in $( seq 1 16 ); do
+for i in $( seq 1 18 ); do
   python w.py start-pg-executor-worker default &
 done
 
