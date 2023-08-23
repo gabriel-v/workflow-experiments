@@ -28,6 +28,9 @@ if typing.TYPE_CHECKING:
 
 log = logging.getLogger(__name__)
 
+encode_obj = pickle.dumps
+decode_obj = pickle.loads
+
 
 def _processify(func):
     '''Decorator to run a function as a process.
@@ -72,7 +75,10 @@ def _processify(func):
     return wrapper
 
 
-def create_table(opt, table):
+def create_queue_table(opt, table):
+    """Create table to be used as message queue for the executor.
+    """
+    
     _sql = sql.SQL("""
         CREATE TABLE IF NOT EXISTS {table} (
             id int not null primary key generated always as identity,
@@ -89,21 +95,42 @@ def create_table(opt, table):
 
 @contextlib.contextmanager
 def get_cursor(opt):
+    """Context manager to get a database cursor and close it after use.
+    
+    Cursor autocommit is off. If needed, turn it on yourself with `cursor.connection.autocommit = True`.
+
+    Args:
+        opt: The arguments passed to psycopg2.connect(**opt).
+
+    Yields:
+        cursor: Database cursor that can be used while the context is active.
+    """
     conn = psycopg2.connect(**opt)
     cur = conn.cursor()
     try:
         yield cur
     finally:
+        cur.close()
         conn.close()
 
 
 def run_worker_single(cur, queue, result_queue=None):
-    """Fetch a batch of tasks from the queue and run them.
+    """Fetch a batch of tasks from the queue and run them, optionally returning result on different queue.
 
-    If we have a result queue, result is put on that.
+    The function is fetched, deleted and executed under a single transaction. This means that if the worker crashes, the transaction removing the items from
+    the queue will be automatically rolled back, so a different worker may retry and execute it.
 
-    Return True if we ran something - so we should run more.
-    """
+    If the function code itself errors out, the error should be returned in place of the result, as part of the result payload. This is handled by `submit_encoded_tasks()`.
+
+    Args:
+        cur: database cursor to be used
+        queue: name of queue table where the tasks are read from
+        result_queue: if set, task results are placed on this second queue.
+
+    Returns:
+        bool: True if we ran something - so we should run more. False otherwise.
+    """    
+
     BATCH_LIMIT = 1
     sql_begin = sql.SQL("""
         BEGIN;
@@ -134,6 +161,21 @@ def run_worker_single(cur, queue, result_queue=None):
 
 @contextlib.contextmanager
 def fetch_results(cur, queue, limit=100):
+    """Context manager for fetching results from a queue under transaction.
+
+    The transaction that deletes messages from the queue is finalized when the context exists normally.
+
+    If the code under this context crashes, the transaction is automatically rolled back,
+    and the message that caused the error is put back on the queue.
+
+    Args:
+        cur: database cursor to be used
+        queue: name of queue table where the tasks are read from
+        limit (int, optional): Maximum number of messages to fetch. Defaults to 100.
+
+    Yields:
+        List[Object]|None: Yields a single list of results, or None if we can't find any.
+    """    
     sql_begin = sql.SQL("""
         BEGIN;
         DELETE FROM {queue}
@@ -153,11 +195,27 @@ def fetch_results(cur, queue, limit=100):
 
 
 def run_worker_until_empty(cur, queue, result_queue=None):
+    """Continuously run worker until we're out of messages.
+
+    Args:
+        cur: database cursor to be used
+        queue: name of queue table where the tasks are read from
+        result_queue: if set, task results are placed on this second queue.
+    """
     while run_worker_single(cur, queue, result_queue):
         pass
 
 
 def decode_and_run(_pk, payload):
+    """Decode a queued payload into function and args, run the function, and return the results or errors.
+
+    Args:
+        _pk: Primary key of queue entry row.
+        payload (bytes): The encoded contents of the task to run. Expected to be a pickled dict with fields `func`, `args` and `kwargs`.
+
+    Returns:
+        Dict: Object containing task metadata (under `task_args`) and function result (under `result`) or error (under `error`)
+    """
     ret_obj = {'_pk': _pk, 'size': len(payload), }
     try:
         obj = decode_obj(payload)
@@ -176,6 +234,16 @@ def decode_and_run(_pk, payload):
 
 
 def encode_run_params(func, args, kw):
+    """Encode object in the format expected by `decode_and_run`.
+
+    Args:
+        func (Callable): function to run
+        args (Tuple): Positional arguments to pass fo `func`
+        kw (Dict): Keyword arguments to pass to `func`
+
+    Returns:
+        bytes: A pickled Dict containing keys `func`, `args`, `kw`
+    """    
     obj = {'func': func}
     obj['args'] = args
     obj['kw'] = kw
@@ -183,6 +251,18 @@ def encode_run_params(func, args, kw):
 
 
 def wait_until_notified(cur, queue, timeout=60, extra_read_fd=None):
+    """Use Postgres-specific commands LISTEN, UNLISTEN to hibernate the process until
+    there is new data to be read from the table queue. To achieve this, we use `select`
+    on the database connection object, to sleep until there is new data to be read.
+
+    Inspired by https://gist.github.com/kissgyorgy/beccba1291de962702ea9c237a900c79
+
+    Args:
+        cur (Cursor): Database cursor we use to run LISTEN/UNLISTEN
+        queue: table queue name
+        timeout (int, optional): Max seconds to wait. Defaults to 60.
+        extra_read_fd (int, optional): FD which, if set, will be passed to `select` alongside the database connection. Can be used to signal early return, so this function can return immediately for worker shutdown.
+    """
     import select
     chan = queue + '_channel'
     sql_listen = sql.SQL('LISTEN {chan}; COMMIT;').format(
@@ -204,6 +284,13 @@ def wait_until_notified(cur, queue, timeout=60, extra_read_fd=None):
 
 
 def run_worker_forever(opt, queue, result_queue=None):
+    """Start and restart worker processes, forever.
+
+    Args:
+        opt: The arguments passed to psycopg2.connect(**opt).
+        queue: name of queue table where the tasks are read from
+        result_queue: if set, task results are placed on this second queue.
+    """
     while True:
         try:
             _run_worker_forever(opt, queue, result_queue)
@@ -214,6 +301,11 @@ def run_worker_forever(opt, queue, result_queue=None):
 
 @_processify
 def _run_worker_forever(opt, queue, result_queue=None):
+    """Run a single python worker sub-process until it crashes or errors out.
+
+    Args:
+        same as `run_worker_forever`
+    """
     with get_cursor(opt) as cur:
         while True:
             try:
@@ -225,6 +317,20 @@ def _run_worker_forever(opt, queue, result_queue=None):
 
 
 def submit_encoded_tasks(cur, queue, payloads):
+    """Inserts some payloads into the queue, then notifies any listeners of that queue.
+
+
+    **WARNING**: This function requires the caller to run `cur.execute('commit')` and finish the transaction.
+    This is done so the caller can control when their own transaction finishes, without using a sub-transaction.
+
+    Args:
+        cur (Cursor): Database cursor we use to run INSERT and NOTIFY
+        queue: table queue name
+        payloads (List[bytes]): A list of the payloads to enqueue.
+
+    Returns:
+        _type_: _description_
+    """
     chan = queue + '_channel'
     sql_notify = sql.SQL('NOTIFY {chan};').format(chan=sql.Identifier(chan))
     sql_insert = sql.SQL(
@@ -244,15 +350,6 @@ def submit_task(opt, queue, func, *args, **kw):
             cur, queue, [encode_run_params(func, args, kw)])[0]
         cur.execute('commit')
         return rv
-
-
-def encode_obj(obj):
-    rv = pickle.dumps(obj)
-    return rv
-
-
-def decode_obj(bytes_):
-    return pickle.loads(bytes_)
 
 
 def exec_task(job_id: int, module_name: str, task_fullname: str,
@@ -288,11 +385,12 @@ class PgExecutor(Executor):
     ):
         super().__init__(name, scheduler=scheduler)
         config = config or dict()
+        name = name or 'default'
         self._scratch_root = config.get('scratch_root', "/tmp")
         self._queue_send = config.get(
-            'queue_send', 'pg_executor_default_queue_send')
+            'queue_send', f'pg_executor_{name}_queue_send')
         self._queue_recv = config.get(
-            'queue_recv', 'pg_executor_default_queue_recv')
+            'queue_recv', f'pg_executor_{name}_queue_recv')
         self._conn_opt = dict(
             (
                 (k, v)
@@ -310,8 +408,10 @@ class PgExecutor(Executor):
         self._thread_signal_write_fd = None
 
     def run_worker(self):
-        create_table(self._conn_opt, self._queue_send)
-        create_table(self._conn_opt, self._queue_recv)
+        """Create queue tables and start a single worker process for this executor, then wait for it to finish.
+        """
+        create_queue_table(self._conn_opt, self._queue_send)
+        create_queue_table(self._conn_opt, self._queue_recv)
         run_worker_forever(self._conn_opt, self._queue_send, self._queue_recv)
 
     def stop(self) -> None:
@@ -331,12 +431,12 @@ class PgExecutor(Executor):
 
     def _start(self) -> None:
         """
-        Start monitoring thread.
+        Start monitoring thread. Workers need to be started separately, on different processes, using `PgExecutor.run_worker()`.
         """
         if not self._is_running:
             os.makedirs(self._scratch_root, exist_ok=True)
-            create_table(self._conn_opt, self._queue_send)
-            create_table(self._conn_opt, self._queue_recv)
+            create_queue_table(self._conn_opt, self._queue_send)
+            create_queue_table(self._conn_opt, self._queue_recv)
 
             (
                 self._thread_signal_read_fd,
@@ -351,7 +451,7 @@ class PgExecutor(Executor):
 
     def _monitor(self) -> None:
         """
-        Thread for monitoring task ack.
+        Thread for monitoring task ack. Uses single long-running database connection.
         """
         assert self._scheduler
 
@@ -373,6 +473,14 @@ class PgExecutor(Executor):
         self.stop()
 
     def _monitor_one(self, cur):
+        """Run a single batch of task monitoring.
+
+        Args:
+            cur (Cursor): Database cursor to use for fetching results.
+
+        Returns:
+            bool: True if we found something on the queue, meaning the caller should immediately run this function again.
+        """
         with fetch_results(cur, self._queue_recv) as results:
             if results is None:
                 return False

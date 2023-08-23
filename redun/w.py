@@ -1,23 +1,22 @@
 import logging
-import json
 import os
 import subprocess
+import sys
 
 import redun.file
 from redun.file import LocalFileSystem
-redun.file.get_filesystem = lambda *k, **w: LocalFileSystem()
-from redun import File as RedunFile, Dir as RedunDir
-
 import redun.scripting
+from redun.config import Config
+from redun import Scheduler
+from redun import task
+from redun import File as RedunFile  #, Dir as RedunDir
+
+import qexecutor  # noqa
+from flock import flock
+
+redun.file.get_filesystem = lambda *k, **w: LocalFileSystem()
 redun.scripting.prepare_command = lambda x, **k: x
 redun.scripting.get_command_eof = lambda x, **k: 'EOFFFFF999'
-
-from redun import task, script
-from redun.functools import map_, apply_func, force
-from redun import Scheduler
-from redun.config import Config
-
-from flock import flock
 
 log = logging.getLogger(__name__)
 
@@ -30,6 +29,7 @@ class File(RedunFile):
         self.stream = None
         self._hash = None
         self.classes.File = File
+
     def __setstate__(self, state: dict) -> None:
         self.path = state["path"]
         self._hash = state["hash"]
@@ -54,10 +54,6 @@ class File(RedunFile):
 #         self.classes.File = File
 
 
-
-import qexecutor
-
-
 PG_URI = "postgresql://localhost:5432/"
 DB_NAME = 'redun_db'
 QUEUE_DB_NAME = 'queue_db'
@@ -67,7 +63,7 @@ ROOT = b'/opt/node/collections/testdata/data'
 redun_namespace = 'w'
 
 DIR_BATCH_COUNT = 1000
-FILE_BATCH_SIZE_BYTES = 66 * 2**20 # 10MB batches
+FILE_BATCH_SIZE_BYTES = 66 * 2**20  # 10MB batches
 FILE_BATCH_MAX_COUNT = 10000
 
 os.makedirs('./.redun', exist_ok=True)
@@ -96,7 +92,8 @@ def create_db(opt, db_name):
     cur.connection.autocommit = True
     try:
         cur.execute(_sql)
-    except (psycopg2.errors.DuplicateDatabase, psycopg2.errors.UniqueViolation):
+    except (psycopg2.errors.DuplicateDatabase,
+            psycopg2.errors.UniqueViolation):
         pass
     cur.close()
     conn.close()
@@ -106,27 +103,23 @@ def write_config_file(config_dict, path):
     import configparser
     with open(path, 'w') as file:
         config_object = configparser.ConfigParser()
-        sections=config_dict.keys()
+        sections = config_dict.keys()
         for section in sections:
             config_object.add_section(section)
         for section in sections:
-            inner_dict=config_dict[section]
-            fields=inner_dict.keys()
+            inner_dict = config_dict[section]
+            fields = inner_dict.keys()
             for field in fields:
-                value=inner_dict[field]
+                value = inner_dict[field]
                 config_object.set(section, field, str(value))
         print('writing config to file', path)
         config_object.write(file)
-
-
-
 
 
 @task()
 def root():
     print('+root')
     return walk([File(ROOT)])[0]
-
 
 
 @task()
@@ -149,7 +142,8 @@ def walk(paths):
             elif os.path.isfile(item):
                 files.append(File(item))
                 file_size += os.stat(item).st_size
-                if file_size > FILE_BATCH_SIZE_BYTES or len(files) > FILE_BATCH_MAX_COUNT:
+                if (file_size > FILE_BATCH_SIZE_BYTES
+                        or len(files) > FILE_BATCH_MAX_COUNT):
                     files_fut.append(handle_files(files))
                     files = []
                     file_size = 0
@@ -170,7 +164,6 @@ def walk_combine(paths, dirs, files):
     files = sum(files, start=[])
     dir_cnt = sum(d['dir_cnt'] for d in dirs) + len(paths)
     file_cnt = len(files) + sum(d['file_cnt'] for d in dirs)
-    file_paths = {}
     file_hashes = set(f['md5'] for f in files)
     for d in dirs:
         file_hashes |= d['hashes']
@@ -234,6 +227,7 @@ def redun_cli():
 
 def get_redun_scheduler(config):
     import time
+    err = None
     for _ in range(3):
         try:
             config = Config(config)
@@ -241,10 +235,11 @@ def get_redun_scheduler(config):
             scheduler.load(migrate=True)
             return scheduler
         except Exception as e:
+            err = e
             time.sleep(1.0)
             log.warning(str(e))
-    log.exception(e)
-    raise e
+    log.exception(err)
+    raise err
 
 
 def redun_run_main(scheduler):
@@ -256,7 +251,6 @@ def redun_run_main(scheduler):
 
 def start_worker(scheduler, executor_name):
     scheduler.executors[executor_name].run_worker()
-
 
 
 @flock

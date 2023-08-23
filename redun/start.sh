@@ -1,6 +1,6 @@
 #!/bin/bash
 set -ex
-rm -rf *.png *.dot redun.db .redun tmp
+rm -rf *.png *.dot redun.db .redun tmp __pycache__
 
 until PGUSER=postgres PGPASSWORD=postgres psql postgresql://localhost:5432 -l --no-readline >/dev/null; do sleep 1; done
 
