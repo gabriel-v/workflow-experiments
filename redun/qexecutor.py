@@ -150,17 +150,18 @@ def run_worker_single(cur, queue, result_queue=None):
         int: the number of tasks executed in this batch, or 0 if none.
     """
 
+    order = random.choice(['ASC', 'DESC'])
     sql_begin = sql.SQL("""
         BEGIN;
         DELETE FROM {queue}
         USING (
             SELECT * FROM {queue}
-            ORDER BY created_at DESC
+            ORDER BY created_at {order}
             LIMIT 1
             FOR UPDATE SKIP LOCKED
         ) q
         WHERE q.id = {queue}.id RETURNING {queue}.*;
-    """).format(queue=sql.Identifier(queue))
+    """).format(queue=sql.Identifier(queue), order=sql.SQL(order))
 
     cur.execute(sql_begin)
     v = cur.fetchall()
@@ -556,19 +557,72 @@ class PgExecutor(Executor):
 
     def stop(self) -> None:
         """
-        Stop Executor and monitoring thread.
+        Stop Executor and monitoring thread,
+        and clear out queue tables.
         """
+        was_running = self._is_running
+        # first, turn off the monitor
         self._is_running = False
         if self._thread_signal_write_fd:
             os.write(self._thread_signal_write_fd, b"x")
 
-        # Stop monitor thread.
+        # Try to clear out the current key from the queue tables.
+        if was_running:
+            # Do args first, to starve the workers, then the results.
+            self._clear_queue_table(self._queue_args)
+            self._clear_queue_table(self._queue_results)
+
         if (
             self._thread
             and self._thread.is_alive()
             and threading.get_ident() != self._thread.ident
         ):
             self._thread.join()
+
+        # Run the clear operations again, since the monitor might have done
+        # more work since we initially stopped it.
+        if was_running:
+            # Do args first, to starve the workers, then the results.
+            self._clear_queue_table(self._queue_args)
+            self._clear_queue_table(self._queue_results)
+
+    def _clear_queue_table(self, queue):
+        """Clear out all rows from the table that have our executor key."""
+
+        # Since we have no cancellation functionality, in-flight
+        # tasks will still have locked rows in the table; so we
+        # use `fetch_results()` to remove them one batch at a time.
+        with get_cursor(self._conn_opt) as cur:
+            empty = False
+            total_count = 0
+            while not empty:
+                with fetch_results(cur, queue, self._executor_key) \
+                        as results:
+                    if results:
+                        total_count += len(results)
+                    else:
+                        empty = True
+            if total_count > 0:
+                log.warning(
+                    'deleted %s pending tasks from queue %s',
+                    total_count, queue,
+                )
+            # Now that we don't have extra rows hanging around, we can
+            # do `delete from {table}` and it will wait on all the active
+            # transactions.
+            # TODO kill db locks on rows with the correct key
+            sql_delete = sql.SQL("""
+                DELETE FROM {table} where executor_key = %s;
+            """).format(
+                table=sql.Identifier(queue),
+            )
+            cur.execute(sql_delete, (self._executor_key,))
+            deleted = cur.rowcount
+            if deleted:
+                log.warning(
+                    'deleted %s running tasks from queue %s',
+                    deleted, queue,
+                )
 
     def _start(self) -> None:
         """

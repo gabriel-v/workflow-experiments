@@ -1,3 +1,5 @@
+import random
+import time
 import logging
 import os
 import subprocess
@@ -226,7 +228,6 @@ def redun_cli():
 
 @flock
 def get_redun_scheduler(config):
-    import time
     err = None
     for _ in range(3):
         try:

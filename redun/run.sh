@@ -9,7 +9,7 @@ docker build . --tag $DOCKER_IMG >/dev/null
 docker rm -f $DOCKER_CONTAINER_NAME || true
 if ! ( docker ps | grep $DOCKER_CONTAINER_NAME ) >/dev/null; then
         docker run \
-                -d \
+                -it \
                 --rm \
                 --hostname $DOCKER_CONTAINER_NAME \
                 --name $DOCKER_CONTAINER_NAME \
@@ -26,5 +26,3 @@ if ! ( docker ps | grep $DOCKER_CONTAINER_NAME ) >/dev/null; then
                 ./start.sh
 
 fi
-
-docker logs -f $DOCKER_CONTAINER_NAME
