@@ -76,8 +76,6 @@ REDUN_CONFIG_VAL = {
     "executors.default": {
         "type": "pg",
         "dsn": PG_URI + QUEUE_DB_NAME,
-        'queue_send': 'q1',
-        'queue_recv': 'q2',
     }
 }
 
@@ -226,6 +224,7 @@ def redun_cli():
         sys.exit(1)
 
 
+@flock
 def get_redun_scheduler(config):
     import time
     err = None

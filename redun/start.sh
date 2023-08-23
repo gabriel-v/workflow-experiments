@@ -12,5 +12,6 @@ done
 
 sleep 1
 
+# python w.py &
 python w.py || true
 sleep 1000000000
